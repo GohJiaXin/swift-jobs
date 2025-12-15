@@ -4,6 +4,7 @@ const cors = require('cors');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const bcrypt = require('bcrypt');
 const { createClient } = require('@supabase/supabase-js');
 const Groq = require('groq-sdk');
 
@@ -118,6 +119,17 @@ app.post('/api/jobseeker/register', upload.single('resume'), async (req, res) =>
       return res.status(400).json({ success: false, error: 'Resume file is required' });
     }
 
+    if (!password || password.length < 6) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Password must be at least 6 characters long' 
+      });
+    }
+
+    // Hash the password
+    const saltRounds = 10;
+    const hashedPassword = await bcrypt.hash(password, saltRounds);
+
     // Extract resume text
     const resumeText = extractResumeText(resumeFile.path);
     const resumeUrl = `/uploads/${resumeFile.filename}`;
@@ -191,7 +203,7 @@ Provide a JSON response with:
       .from('users')
       .insert([{
         email,
-        password_hash: password, // TODO: Hash password with bcrypt in production
+        password_hash: hashedPassword, // Store hashed password
         user_type: 'job_seeker',
         full_name: name
       }])
@@ -251,12 +263,23 @@ app.post('/api/employer/register', async (req, res) => {
   try {
     const { name, email, password, companyName, companySize, industry } = req.body;
 
+    if (!password || password.length < 6) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Password must be at least 6 characters long' 
+      });
+    }
+
+    // Hash the password
+    const saltRounds = 10;
+    const hashedPassword = await bcrypt.hash(password, saltRounds);
+
     // Insert user
     const { data: userData, error: userError } = await supabase
       .from('users')
       .insert([{
         email,
-        password_hash: password, // TODO: Hash password with bcrypt in production
+        password_hash: hashedPassword, // Store hashed password
         user_type: 'employer',
         full_name: name
       }])
@@ -457,6 +480,78 @@ Provide a JSON response:
 // Health check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// Login endpoint
+app.post('/api/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Email and password are required' 
+      });
+    }
+
+    // Get user from database
+    const { data: user, error: userError } = await supabase
+      .from('users')
+      .select('*')
+      .eq('email', email)
+      .single();
+
+    if (userError || !user) {
+      return res.status(401).json({ 
+        success: false, 
+        error: 'Invalid email or password' 
+      });
+    }
+
+    // Compare passwords
+    const passwordMatch = await bcrypt.compare(password, user.password_hash);
+
+    if (!passwordMatch) {
+      return res.status(401).json({ 
+        success: false, 
+        error: 'Invalid email or password' 
+      });
+    }
+
+    // Get additional profile data based on user type
+    let profileData = null;
+    if (user.user_type === 'job_seeker') {
+      const { data } = await supabase
+        .from('job_seekers')
+        .select('*')
+        .eq('user_id', user.id)
+        .single();
+      profileData = data;
+    } else if (user.user_type === 'employer') {
+      const { data } = await supabase
+        .from('employers')
+        .select('*')
+        .eq('user_id', user.id)
+        .single();
+      profileData = data;
+    }
+
+    // Return user info (excluding password hash)
+    res.json({
+      success: true,
+      user: {
+        id: user.id,
+        email: user.email,
+        fullName: user.full_name,
+        userType: user.user_type,
+        createdAt: user.created_at
+      },
+      profile: profileData
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
 app.listen(PORT, () => {
