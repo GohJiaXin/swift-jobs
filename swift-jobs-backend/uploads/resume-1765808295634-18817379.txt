@@ -1,0 +1,53 @@
+John Doe
+Email: john@example.com | Phone: (555) 123-4567
+LinkedIn: linkedin.com/in/johndoe-tech | GitHub: github.com/johndoe-dev
+
+Objective
+Motivated and detail-oriented Computer Science student seeking an IT Intern position to apply theoretical knowledge in a practical environment, gain hands-on experience with network administration, troubleshooting, and software support, and contribute to team projects.
+
+Education
+Bachelor of Science in Computer Science
+University of Technology, Anytown, USA
+Expected Graduation: May 2025
+GPA: 3.6/4.0
+Relevant Coursework: Data Structures, Computer Networks, Operating Systems, Database Management, Cybersecurity Fundamentals
+
+Technical Skills
+Languages: Python, Java, SQL, HTML/CSS, JavaScript (Basic)
+
+Tools & Platforms: Git, Linux/Unix, Windows Server, Wireshark, VMware, Microsoft Office
+
+Concepts: Troubleshooting, Help Desk Support, Network Protocols (TCP/IP, DNS), Basic Cybersecurity
+
+Projects
+Home Lab Network Setup
+
+Configured a small home lab with a router, switch, and two virtual machines to practice networking concepts.
+
+Set up DHCP, DNS, and firewall rules using pfSense.
+
+Student Database Management System
+
+Developed a Python-based CLI application to manage student records using SQLite.
+
+Implemented CRUD operations and basic data validation.
+
+Experience
+Technology Assistant – University IT Help Desk (Part-time, Sep 2023 – Present)
+
+Provided technical support to students and faculty via phone, email, and walk-ins.
+
+Assisted with password resets, software installation, network connectivity issues, and hardware troubleshooting.
+
+Documented and resolved 15+ tickets weekly with a 95% satisfaction rate.
+
+Certifications
+Google IT Support Professional Certificate (In Progress)
+
+CompTIA A+ (Expected 2024)
+
+Extracurricular
+Member, University Cybersecurity Club
+
+Volunteer Tech Tutor for local non-profit
+

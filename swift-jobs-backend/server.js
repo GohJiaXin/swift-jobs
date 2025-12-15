@@ -5,6 +5,7 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const bcrypt = require('bcrypt');
+const pdf = require('pdf-parse');
 const { createClient } = require('@supabase/supabase-js');
 const Groq = require('groq-sdk');
 
@@ -94,16 +95,24 @@ async function analyzeWithGroq(prompt) {
 }
 
 // Helper function to extract text from resume file
-function extractResumeText(filePath) {
-  // For now, we'll read text files directly
-  // You can add PDF parsing libraries later (like pdf-parse)
+async function extractResumeText(filePath) {
   try {
-    if (path.extname(filePath).toLowerCase() === '.txt') {
+    const fileExt = path.extname(filePath).toLowerCase();
+    
+    if (fileExt === '.txt') {
       return fs.readFileSync(filePath, 'utf8');
+    } else if (fileExt === '.pdf') {
+      const dataBuffer = fs.readFileSync(filePath);
+      const pdfData = await pdf(dataBuffer);
+      return pdfData.text;
+    } else {
+      // For DOC/DOCX files, return a placeholder
+      // You can add mammoth library for DOC/DOCX parsing if needed
+      return `Document file uploaded: ${path.basename(filePath)}. Please extract text manually.`;
     }
-    return `Resume file uploaded: ${path.basename(filePath)}`;
   } catch (error) {
-    return 'Unable to extract resume text';
+    console.error('Error extracting text:', error);
+    return `Unable to extract text from ${path.basename(filePath)}`;
   }
 }
 
@@ -131,7 +140,7 @@ app.post('/api/jobseeker/register', upload.single('resume'), async (req, res) =>
     const hashedPassword = await bcrypt.hash(password, saltRounds);
 
     // Extract resume text
-    const resumeText = extractResumeText(resumeFile.path);
+    const resumeText = await extractResumeText(resumeFile.path);
     const resumeUrl = `/uploads/${resumeFile.filename}`;
 
     // Parse answers if sent as string
@@ -314,17 +323,54 @@ app.post('/api/employer/register', async (req, res) => {
   }
 });
 
-// Job Posting
-app.post('/api/job/post', async (req, res) => {
+// Job Posting (with optional file upload for job description)
+app.post('/api/job/post/:employerId', upload.single('jobDescriptionFile'), async (req, res) => {
   try {
-    const { employerId, title, description, requirements, location, salaryRange } = req.body;
+    const { employerId } = req.params; // Get employerId from URL
+    const { title, description, requirements, location, salaryRange } = req.body;
+    const jobDescFile = req.file;
+
+    // Validate employerId
+    if (!employerId) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Employer ID is required in the URL' 
+      });
+    }
+
+    // Extract job description from file if uploaded, otherwise use text input
+    let jobDescription = description || '';
+    let jobDescUrl = null;
+
+    if (jobDescFile) {
+      const extractedText = await extractResumeText(jobDescFile.path);
+      jobDescription = extractedText;
+      jobDescUrl = `/uploads/${jobDescFile.filename}`;
+    }
+
+    if (!jobDescription || jobDescription.trim().length === 0) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Job description is required (either as text or file upload)' 
+      });
+    }
+
+    // Parse requirements if it's a string
+    let jobRequirements = requirements;
+    if (typeof requirements === 'string') {
+      try {
+        jobRequirements = JSON.parse(requirements);
+      } catch (e) {
+        jobRequirements = requirements; // Keep as string if not JSON
+      }
+    }
 
     // Analyze job requirements with Groq
     const analysisPrompt = `Analyze this job posting:
     
 Title: ${title}
-Description: ${description}
-Requirements: ${requirements}
+Description: ${jobDescription}
+Requirements: ${typeof jobRequirements === 'object' ? JSON.stringify(jobRequirements) : jobRequirements}
 
 Provide a JSON response with:
 {
@@ -361,22 +407,30 @@ Provide a JSON response with:
       .insert([{
         employer_id: employerId,
         title,
-        description,
-        requirements: JSON.stringify(requirements),
-        required_skills: JSON.stringify(jobData.required_skills),
-        behavioral_traits: JSON.stringify(jobData.behavioral_traits),
+        description: jobDescription,
+        requirements: typeof jobRequirements === 'string' ? jobRequirements : jobRequirements,
+        required_skills: jobData.required_skills,
+        behavioral_traits: jobData.behavioral_traits,
         location,
         salary_range: salaryRange,
         is_active: true
       }])
       .select();
 
-    if (error) throw error;
+    if (error) {
+      console.error('Job listing insert error:', error);
+      throw error;
+    }
 
     res.json({ 
       success: true, 
       jobId: data[0].id,
-      analysis: jobData
+      jobDescriptionUrl: jobDescUrl,
+      analysis: {
+        required_skills: jobData.required_skills || [],
+        behavioral_traits: jobData.behavioral_traits || {},
+        experience_level: jobData.experience_level || "mid"
+      }
     });
   } catch (error) {
     console.error('Error posting job:', error);
