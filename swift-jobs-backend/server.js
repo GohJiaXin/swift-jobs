@@ -1,15 +1,59 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
 const { createClient } = require('@supabase/supabase-js');
 const Groq = require('groq-sdk');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// Create uploads directory if it doesn't exist
+const uploadDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadDir)) {
+  fs.mkdirSync(uploadDir);
+}
+
+// Configure multer for file uploads
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, uploadDir);
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
+  }
+});
+
+const upload = multer({
+  storage: storage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
+  fileFilter: (req, file, cb) => {
+    const allowedExtensions = /\.(pdf|doc|docx|txt)$/i;
+    const allowedMimetypes = [
+      'application/pdf',
+      'application/msword',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'text/plain'
+    ];
+    
+    const extname = allowedExtensions.test(file.originalname.toLowerCase());
+    const mimetype = allowedMimetypes.includes(file.mimetype);
+    
+    if (mimetype || extname) {
+      return cb(null, true);
+    } else {
+      cb(new Error('Only PDF, DOC, DOCX, and TXT files are allowed'));
+    }
+  }
+});
+
 // Middleware
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
+app.use('/uploads', express.static(uploadDir));
 
 // Initialize Supabase
 const supabase = createClient(
@@ -48,75 +92,153 @@ async function analyzeWithGroq(prompt) {
   }
 }
 
+// Helper function to extract text from resume file
+function extractResumeText(filePath) {
+  // For now, we'll read text files directly
+  // You can add PDF parsing libraries later (like pdf-parse)
+  try {
+    if (path.extname(filePath).toLowerCase() === '.txt') {
+      return fs.readFileSync(filePath, 'utf8');
+    }
+    return `Resume file uploaded: ${path.basename(filePath)}`;
+  } catch (error) {
+    return 'Unable to extract resume text';
+  }
+}
+
 // API Routes
 
-// Job Seeker Registration
-app.post('/api/jobseeker/register', async (req, res) => {
+// Job Seeker Registration (with file upload)
+app.post('/api/jobseeker/register', upload.single('resume'), async (req, res) => {
   try {
-    const { name, email, resume, answers } = req.body;
+    const { name, email, password, answers } = req.body;
+    const resumeFile = req.file;
+
+    if (!resumeFile) {
+      return res.status(400).json({ success: false, error: 'Resume file is required' });
+    }
+
+    // Extract resume text
+    const resumeText = extractResumeText(resumeFile.path);
+    const resumeUrl = `/uploads/${resumeFile.filename}`;
+
+    // Parse answers if sent as string
+    let behavioralAnswers;
+    try {
+      behavioralAnswers = typeof answers === 'string' ? JSON.parse(answers) : answers;
+    } catch (parseError) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Invalid answers format. Must be a JSON array like: ["answer1", "answer2", "answer3"]' 
+      });
+    }
+
+    if (!Array.isArray(behavioralAnswers)) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Answers must be an array' 
+      });
+    }
 
     // Analyze resume and answers with Groq
     const analysisPrompt = `Analyze this job seeker profile:
     
-Resume: ${resume}
+Resume: ${resumeText}
 
 Behavioral Answers:
-${answers.map((answer, idx) => `Q${idx + 1}: ${answer}`).join('\n')}
+${behavioralAnswers.map((answer, idx) => `Q${idx + 1}: ${answer}`).join('\n')}
 
 Provide a JSON response with:
 {
   "technical_skills": ["skill1", "skill2", ...],
   "soft_skills": ["skill1", "skill2", ...],
   "work_style": "description",
-  "preferences": "description",
-  "experience_level": "junior/mid/senior",
-  "key_strengths": ["strength1", "strength2", ...]
+  "experience_years": 3,
+  "preferred_roles": ["role1", "role2", ...],
+  "behavioral_traits": {
+    "teamwork": "high/medium/low",
+    "leadership": "high/medium/low",
+    "adaptability": "high/medium/low"
+  }
 }`;
 
     const analysis = await analyzeWithGroq(analysisPrompt);
     let profileData;
     
     try {
-      // Extract JSON from the response
       const jsonMatch = analysis.match(/\{[\s\S]*\}/);
       profileData = jsonMatch ? JSON.parse(jsonMatch[0]) : {
         technical_skills: [],
         soft_skills: [],
         work_style: "Not specified",
-        preferences: "Not specified",
-        experience_level: "mid",
-        key_strengths: []
+        experience_years: 0,
+        preferred_roles: [],
+        behavioral_traits: {}
       };
     } catch (parseError) {
       profileData = {
         technical_skills: [],
         soft_skills: [],
         work_style: "Not specified",
-        preferences: "Not specified",
-        experience_level: "mid",
-        key_strengths: []
+        experience_years: 0,
+        preferred_roles: [],
+        behavioral_traits: {}
       };
     }
 
-    // Insert into Supabase
-    const { data, error } = await supabase
-      .from('job_seekers')
+    // Insert user
+    const { data: userData, error: userError } = await supabase
+      .from('users')
       .insert([{
-        name,
         email,
-        resume,
-        behavioral_answers: answers,
-        profile_analysis: profileData,
-        created_at: new Date().toISOString()
+        password_hash: password, // TODO: Hash password with bcrypt in production
+        user_type: 'job_seeker',
+        full_name: name
       }])
       .select();
 
-    if (error) throw error;
+    if (userError) throw userError;
+
+    const userId = userData[0].id;
+
+    // Combine technical and soft skills
+    const allSkills = [
+      ...(profileData.technical_skills || []),
+      ...(profileData.soft_skills || [])
+    ];
+
+    // Insert job seeker profile
+    const { data: seekerData, error: seekerError } = await supabase
+      .from('job_seekers')
+      .insert([{
+        user_id: userId,
+        skills: allSkills, // Supabase will handle JSONB conversion
+        experience_years: parseInt(profileData.experience_years) || 0,
+        preferred_roles: profileData.preferred_roles || [],
+        resume_text: resumeText,
+        behavioral_traits: profileData.behavioral_traits || {},
+        match_confidence: 0.0
+      }])
+      .select();
+
+    if (seekerError) {
+      console.error('Job seeker insert error:', seekerError);
+      throw seekerError;
+    }
 
     res.json({ 
       success: true, 
-      userId: data[0].id,
-      analysis: profileData
+      userId: userId,
+      seekerId: seekerData[0].id,
+      resumeUrl: resumeUrl,
+      analysis: {
+        technical_skills: profileData.technical_skills || [],
+        soft_skills: profileData.soft_skills || [],
+        work_style: profileData.work_style || "Not specified",
+        experience_years: profileData.experience_years || 0,
+        preferred_roles: profileData.preferred_roles || [],
+        behavioral_traits: profileData.behavioral_traits || {}
+      }
     });
   } catch (error) {
     console.error('Error registering job seeker:', error);
@@ -124,27 +246,72 @@ Provide a JSON response with:
   }
 });
 
+// Employer Registration
+app.post('/api/employer/register', async (req, res) => {
+  try {
+    const { name, email, password, companyName, companySize, industry } = req.body;
+
+    // Insert user
+    const { data: userData, error: userError } = await supabase
+      .from('users')
+      .insert([{
+        email,
+        password_hash: password, // TODO: Hash password with bcrypt in production
+        user_type: 'employer',
+        full_name: name
+      }])
+      .select();
+
+    if (userError) throw userError;
+
+    const userId = userData[0].id;
+
+    // Insert employer profile
+    const { data: employerData, error: employerError } = await supabase
+      .from('employers')
+      .insert([{
+        user_id: userId,
+        company_name: companyName,
+        company_size: companySize,
+        industry: industry,
+        hr_contact_name: name
+      }])
+      .select();
+
+    if (employerError) throw employerError;
+
+    res.json({ 
+      success: true, 
+      userId: userId,
+      employerId: employerData[0].id
+    });
+  } catch (error) {
+    console.error('Error registering employer:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // Job Posting
 app.post('/api/job/post', async (req, res) => {
   try {
-    const { company, email, jobTitle, description, preferences } = req.body;
+    const { employerId, title, description, requirements, location, salaryRange } = req.body;
 
     // Analyze job requirements with Groq
     const analysisPrompt = `Analyze this job posting:
     
-Company: ${company}
-Job Title: ${jobTitle}
+Title: ${title}
 Description: ${description}
-Preferences: ${preferences}
+Requirements: ${requirements}
 
 Provide a JSON response with:
 {
   "required_skills": ["skill1", "skill2", ...],
-  "preferred_skills": ["skill1", "skill2", ...],
-  "work_style": "description",
-  "culture_fit": "description",
-  "experience_level": "junior/mid/senior",
-  "key_requirements": ["req1", "req2", ...]
+  "behavioral_traits": {
+    "teamwork": "high/medium/low",
+    "leadership": "high/medium/low",
+    "independence": "high/medium/low"
+  },
+  "experience_level": "junior/mid/senior"
 }`;
 
     const analysis = await analyzeWithGroq(analysisPrompt);
@@ -154,34 +321,30 @@ Provide a JSON response with:
       const jsonMatch = analysis.match(/\{[\s\S]*\}/);
       jobData = jsonMatch ? JSON.parse(jsonMatch[0]) : {
         required_skills: [],
-        preferred_skills: [],
-        work_style: "Not specified",
-        culture_fit: "Not specified",
-        experience_level: "mid",
-        key_requirements: []
+        behavioral_traits: {},
+        experience_level: "mid"
       };
     } catch (parseError) {
       jobData = {
         required_skills: [],
-        preferred_skills: [],
-        work_style: "Not specified",
-        culture_fit: "Not specified",
-        experience_level: "mid",
-        key_requirements: []
+        behavioral_traits: {},
+        experience_level: "mid"
       };
     }
 
-    // Insert into Supabase
+    // Insert job listing
     const { data, error } = await supabase
-      .from('jobs')
+      .from('job_listings')
       .insert([{
-        company,
-        email,
-        job_title: jobTitle,
+        employer_id: employerId,
+        title,
         description,
-        preferences,
-        job_analysis: jobData,
-        created_at: new Date().toISOString()
+        requirements: JSON.stringify(requirements),
+        required_skills: JSON.stringify(jobData.required_skills),
+        behavioral_traits: JSON.stringify(jobData.behavioral_traits),
+        location,
+        salary_range: salaryRange,
+        is_active: true
       }])
       .select();
 
@@ -199,185 +362,94 @@ Provide a JSON response with:
 });
 
 // Get matches for job seeker
-app.get('/api/matches/:userId', async (req, res) => {
+app.get('/api/matches/:seekerId', async (req, res) => {
   try {
-    const { userId } = req.params;
+    const { seekerId } = req.params;
 
     // Get job seeker profile
     const { data: seeker, error: seekerError } = await supabase
       .from('job_seekers')
       .select('*')
-      .eq('id', userId)
+      .eq('id', seekerId)
       .single();
 
     if (seekerError) throw seekerError;
 
-    // Get all jobs
+    // Get all active jobs
     const { data: jobs, error: jobsError } = await supabase
-      .from('jobs')
-      .select('*');
+      .from('job_listings')
+      .select('*, employers(*)')
+      .eq('is_active', true);
 
     if (jobsError) throw jobsError;
 
     // Match each job with the seeker
     const matches = await Promise.all(jobs.map(async (job) => {
-      const matchPrompt = `Score this job match (0-100%):
+      const matchPrompt = `Score this job match (0-1.0):
 
-Job Seeker Profile:
-Technical Skills: ${seeker.profile_analysis.technical_skills?.join(', ') || 'Not specified'}
-Soft Skills: ${seeker.profile_analysis.soft_skills?.join(', ') || 'Not specified'}
-Work Style: ${seeker.profile_analysis.work_style || 'Not specified'}
-Experience: ${seeker.profile_analysis.experience_level || 'Not specified'}
+Job Seeker:
+Skills: ${seeker.skills}
+Experience: ${seeker.experience_years} years
+Preferred Roles: ${seeker.preferred_roles}
 
-Job Requirements:
-Company: ${job.company}
-Title: ${job.job_title}
-Required Skills: ${job.job_analysis.required_skills?.join(', ') || 'Not specified'}
-Work Style: ${job.job_analysis.work_style || 'Not specified'}
-Experience Needed: ${job.job_analysis.experience_level || 'Not specified'}
+Job:
+Title: ${job.title}
+Required Skills: ${job.required_skills}
+Description: ${job.description}
 
 Provide a JSON response:
 {
-  "score": 85,
-  "breakdown": "Detailed explanation of the match, highlighting strengths and areas of alignment"
+  "match_score": 0.85,
+  "technical_fit": 0.90,
+  "behavioral_fit": 0.80,
+  "explanation": "Strong match because..."
 }`;
 
       const matchResult = await analyzeWithGroq(matchPrompt);
       
       try {
         const jsonMatch = matchResult.match(/\{[\s\S]*\}/);
-        const matchData = jsonMatch ? JSON.parse(jsonMatch[0]) : { score: 70, breakdown: "Good general fit" };
+        const matchData = jsonMatch ? JSON.parse(jsonMatch[0]) : { 
+          match_score: 0.70, 
+          technical_fit: 0.70,
+          behavioral_fit: 0.70,
+          explanation: "Good general fit" 
+        };
         
         return {
           jobId: job.id,
-          jobTitle: job.job_title,
-          company: job.company,
-          score: matchData.score || 70,
-          breakdown: matchData.breakdown || "Potential match based on profile"
+          jobTitle: job.title,
+          company: job.employers.company_name,
+          location: job.location,
+          salaryRange: job.salary_range,
+          matchScore: (matchData.match_score * 100).toFixed(0),
+          technicalFit: (matchData.technical_fit * 100).toFixed(0),
+          behavioralFit: (matchData.behavioral_fit * 100).toFixed(0),
+          explanation: matchData.explanation
         };
       } catch (parseError) {
         return {
           jobId: job.id,
-          jobTitle: job.job_title,
-          company: job.company,
-          score: 70,
-          breakdown: "Potential match based on profile"
+          jobTitle: job.title,
+          company: job.employers.company_name,
+          location: job.location,
+          salaryRange: job.salary_range,
+          matchScore: 70,
+          technicalFit: 70,
+          behavioralFit: 70,
+          explanation: "Potential match based on profile"
         };
       }
     }));
 
-    // Sort by score and filter >= 75%
+    // Sort by match score and filter >= 75%
     const sortedMatches = matches
-      .filter(m => m.score >= 75)
-      .sort((a, b) => b.score - a.score);
+      .filter(m => m.matchScore >= 75)
+      .sort((a, b) => b.matchScore - a.matchScore);
 
     res.json({ matches: sortedMatches });
   } catch (error) {
     console.error('Error fetching matches:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// Get candidates for job
-app.get('/api/candidates/:jobId', async (req, res) => {
-  try {
-    const { jobId } = req.params;
-
-    // Get job details
-    const { data: job, error: jobError } = await supabase
-      .from('jobs')
-      .select('*')
-      .eq('id', jobId)
-      .single();
-
-    if (jobError) throw jobError;
-
-    // Get all job seekers
-    const { data: seekers, error: seekersError } = await supabase
-      .from('job_seekers')
-      .select('*');
-
-    if (seekersError) throw seekersError;
-
-    // Match each candidate with the job
-    const candidates = await Promise.all(seekers.map(async (seeker) => {
-      const matchPrompt = `Score this candidate match (0-100%):
-
-Job Requirements:
-Company: ${job.company}
-Title: ${job.job_title}
-Required Skills: ${job.job_analysis.required_skills?.join(', ') || 'Not specified'}
-Preferred Skills: ${job.job_analysis.preferred_skills?.join(', ') || 'Not specified'}
-Work Style: ${job.job_analysis.work_style || 'Not specified'}
-Experience Needed: ${job.job_analysis.experience_level || 'Not specified'}
-
-Candidate Profile:
-Name: ${seeker.name}
-Technical Skills: ${seeker.profile_analysis.technical_skills?.join(', ') || 'Not specified'}
-Soft Skills: ${seeker.profile_analysis.soft_skills?.join(', ') || 'Not specified'}
-Work Style: ${seeker.profile_analysis.work_style || 'Not specified'}
-Experience: ${seeker.profile_analysis.experience_level || 'Not specified'}
-
-Provide a JSON response:
-{
-  "score": 85,
-  "breakdown": "e.g., '85% - Strong React skills, collaborative mindset, prefers hybrid work. Good culture fit with agile experience.'"
-}`;
-
-      const matchResult = await analyzeWithGroq(matchPrompt);
-      
-      try {
-        const jsonMatch = matchResult.match(/\{[\s\S]*\}/);
-        const matchData = jsonMatch ? JSON.parse(jsonMatch[0]) : { score: 70, breakdown: "Good general fit" };
-        
-        return {
-          candidateId: seeker.id,
-          candidateName: seeker.name,
-          candidateEmail: seeker.email,
-          score: matchData.score || 70,
-          breakdown: matchData.breakdown || "Potential candidate based on requirements"
-        };
-      } catch (parseError) {
-        return {
-          candidateId: seeker.id,
-          candidateName: seeker.name,
-          candidateEmail: seeker.email,
-          score: 70,
-          breakdown: "Potential candidate based on requirements"
-        };
-      }
-    }));
-
-    // Sort by score
-    const sortedCandidates = candidates.sort((a, b) => b.score - a.score);
-
-    res.json({ candidates: sortedCandidates });
-  } catch (error) {
-    console.error('Error fetching candidates:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// Send message
-app.post('/api/message/send', async (req, res) => {
-  try {
-    const { matchId, message, sender } = req.body;
-
-    const { data, error } = await supabase
-      .from('messages')
-      .insert([{
-        match_id: matchId,
-        message,
-        sender,
-        sent_at: new Date().toISOString()
-      }])
-      .select();
-
-    if (error) throw error;
-
-    res.json({ success: true, messageId: data[0].id });
-  } catch (error) {
-    console.error('Error sending message:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -389,4 +461,5 @@ app.get('/api/health', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Swift Jobs API running on port ${PORT}`);
+  console.log(`Uploads directory: ${uploadDir}`);
 });
