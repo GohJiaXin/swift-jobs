@@ -438,7 +438,134 @@ Provide a JSON response with:
   }
 });
 
-// Get matches for job seeker
+// Get candidates for job
+app.get('/api/candidates/:jobId', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+
+    // Get job details
+    const { data: job, error: jobError } = await supabase
+      .from('job_listings')
+      .select('*, employers(*)')
+      .eq('id', jobId)
+      .single();
+
+    if (jobError) throw jobError;
+
+    // Get all job seekers
+    const { data: seekers, error: seekersError } = await supabase
+      .from('job_seekers')
+      .select('*, users(email, full_name)')
+      .eq('is_active', true);
+
+    if (seekersError) throw seekersError;
+
+    // Match each candidate with the job
+    const candidateResults = await Promise.all(seekers.map(async (seeker) => {
+      const matchPrompt = `Score this candidate match (0-1.0):
+
+Job Requirements:
+Company: ${job.employers.company_name}
+Title: ${job.title}
+Required Skills: ${JSON.stringify(job.required_skills)}
+Behavioral Requirements: ${JSON.stringify(job.behavioral_traits)}
+Description: ${job.description}
+
+Candidate Profile:
+Name: ${seeker.users.full_name}
+Skills: ${JSON.stringify(seeker.skills)}
+Experience: ${seeker.experience_years} years
+Preferred Roles: ${JSON.stringify(seeker.preferred_roles)}
+Behavioral Traits: ${JSON.stringify(seeker.behavioral_traits)}
+
+Provide a JSON response:
+{
+  "match_score": 0.85,
+  "technical_fit": 0.90,
+  "behavioral_fit": 0.80,
+  "explanation": "Strong candidate because..."
+}`;
+
+      const matchResult = await analyzeWithGroq(matchPrompt);
+      
+      try {
+        const jsonMatch = matchResult.match(/\{[\s\S]*\}/);
+        const matchData = jsonMatch ? JSON.parse(jsonMatch[0]) : { 
+          match_score: 0.70, 
+          technical_fit: 0.70,
+          behavioral_fit: 0.70,
+          explanation: "Good general fit" 
+        };
+        
+        return {
+          candidateId: seeker.id,
+          candidateName: seeker.users.full_name,
+          candidateEmail: seeker.users.email,
+          matchScore: parseFloat(matchData.match_score.toFixed(2)),
+          technicalFit: parseFloat(matchData.technical_fit.toFixed(2)),
+          behavioralFit: parseFloat(matchData.behavioral_fit.toFixed(2)),
+          explanation: matchData.explanation
+        };
+      } catch (parseError) {
+        return {
+          candidateId: seeker.id,
+          candidateName: seeker.users.full_name,
+          candidateEmail: seeker.users.email,
+          matchScore: 0.70,
+          technicalFit: 0.70,
+          behavioralFit: 0.70,
+          explanation: "Potential candidate based on requirements"
+        };
+      }
+    }));
+
+    // Save all matches to database (even low scores, employer can review)
+    const matchesToInsert = candidateResults.map(match => ({
+      job_seeker_id: match.candidateId,
+      job_listing_id: jobId,
+      match_score: match.matchScore,
+      technical_fit: match.technicalFit,
+      behavioral_fit: match.behavioralFit,
+      status: 'pending',
+      match_date: new Date().toISOString()
+    }));
+
+    if (matchesToInsert.length > 0) {
+      // Use upsert to avoid duplicate entries
+      const { data: insertedMatches, error: matchInsertError } = await supabase
+        .from('matches')
+        .upsert(matchesToInsert, { 
+          onConflict: 'job_seeker_id,job_listing_id',
+          ignoreDuplicates: false 
+        })
+        .select();
+
+      if (matchInsertError) {
+        console.error('Match insert error:', matchInsertError);
+        // Continue anyway, we can still return the candidates
+      }
+    }
+
+    // Sort by match score (descending)
+    const sortedCandidates = candidateResults
+      .sort((a, b) => b.matchScore - a.matchScore)
+      .map(c => ({
+        ...c,
+        matchScore: (c.matchScore * 100).toFixed(0) + '%',
+        technicalFit: (c.technicalFit * 100).toFixed(0) + '%',
+        behavioralFit: (c.behavioralFit * 100).toFixed(0) + '%'
+      }));
+
+    res.json({ 
+      success: true,
+      candidateCount: sortedCandidates.length,
+      candidates: sortedCandidates 
+    });
+  } catch (error) {
+    console.error('Error fetching candidates:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 app.get('/api/matches/:seekerId', async (req, res) => {
   try {
     const { seekerId } = req.params;
@@ -461,17 +588,19 @@ app.get('/api/matches/:seekerId', async (req, res) => {
     if (jobsError) throw jobsError;
 
     // Match each job with the seeker
-    const matches = await Promise.all(jobs.map(async (job) => {
+    const matchResults = await Promise.all(jobs.map(async (job) => {
       const matchPrompt = `Score this job match (0-1.0):
 
 Job Seeker:
-Skills: ${seeker.skills}
+Skills: ${JSON.stringify(seeker.skills)}
 Experience: ${seeker.experience_years} years
-Preferred Roles: ${seeker.preferred_roles}
+Preferred Roles: ${JSON.stringify(seeker.preferred_roles)}
+Behavioral Traits: ${JSON.stringify(seeker.behavioral_traits)}
 
 Job:
 Title: ${job.title}
-Required Skills: ${job.required_skills}
+Required Skills: ${JSON.stringify(job.required_skills)}
+Behavioral Requirements: ${JSON.stringify(job.behavioral_traits)}
 Description: ${job.description}
 
 Provide a JSON response:
@@ -499,9 +628,9 @@ Provide a JSON response:
           company: job.employers.company_name,
           location: job.location,
           salaryRange: job.salary_range,
-          matchScore: (matchData.match_score * 100).toFixed(0),
-          technicalFit: (matchData.technical_fit * 100).toFixed(0),
-          behavioralFit: (matchData.behavioral_fit * 100).toFixed(0),
+          matchScore: parseFloat(matchData.match_score.toFixed(2)),
+          technicalFit: parseFloat(matchData.technical_fit.toFixed(2)),
+          behavioralFit: parseFloat(matchData.behavioral_fit.toFixed(2)),
           explanation: matchData.explanation
         };
       } catch (parseError) {
@@ -511,22 +640,187 @@ Provide a JSON response:
           company: job.employers.company_name,
           location: job.location,
           salaryRange: job.salary_range,
-          matchScore: 70,
-          technicalFit: 70,
-          behavioralFit: 70,
+          matchScore: 0.70,
+          technicalFit: 0.70,
+          behavioralFit: 0.70,
           explanation: "Potential match based on profile"
         };
       }
     }));
 
-    // Sort by match score and filter >= 75%
-    const sortedMatches = matches
-      .filter(m => m.matchScore >= 75)
-      .sort((a, b) => b.matchScore - a.matchScore);
+    // Filter matches >= 75% (0.75)
+    const goodMatches = matchResults.filter(m => m.matchScore >= 0.75);
 
-    res.json({ matches: sortedMatches });
+    // Save matches to database
+    const matchesToInsert = goodMatches.map(match => ({
+      job_seeker_id: seekerId,
+      job_listing_id: match.jobId,
+      match_score: match.matchScore,
+      technical_fit: match.technicalFit,
+      behavioral_fit: match.behavioralFit,
+      status: 'pending',
+      match_date: new Date().toISOString()
+    }));
+
+    if (matchesToInsert.length > 0) {
+      // Use upsert to avoid duplicate entries
+      const { data: insertedMatches, error: matchInsertError } = await supabase
+        .from('matches')
+        .upsert(matchesToInsert, { 
+          onConflict: 'job_seeker_id,job_listing_id',
+          ignoreDuplicates: false 
+        })
+        .select();
+
+      if (matchInsertError) {
+        console.error('Match insert error:', matchInsertError);
+        // Continue anyway, we can still return the matches
+      }
+    }
+
+    // Sort by match score (descending)
+    const sortedMatches = goodMatches
+      .sort((a, b) => b.matchScore - a.matchScore)
+      .map(m => ({
+        ...m,
+        matchScore: (m.matchScore * 100).toFixed(0) + '%',
+        technicalFit: (m.technicalFit * 100).toFixed(0) + '%',
+        behavioralFit: (m.behavioralFit * 100).toFixed(0) + '%'
+      }));
+
+    res.json({ 
+      success: true,
+      matchCount: sortedMatches.length,
+      matches: sortedMatches 
+    });
   } catch (error) {
     console.error('Error fetching matches:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Get candidates for job
+app.get('/api/candidates/:jobId', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+
+    // Get job details
+    const { data: job, error: jobError } = await supabase
+      .from('job_listings')
+      .select('*, employers(*)')
+      .eq('id', jobId)
+      .single();
+
+    if (jobError) throw jobError;
+
+    // Get all job seekers
+    const { data: seekers, error: seekersError } = await supabase
+      .from('job_seekers')
+      .select('*, users(email, full_name)');
+
+    if (seekersError) throw seekersError;
+
+    // Match each candidate with the job
+    const candidateResults = await Promise.all(seekers.map(async (seeker) => {
+      const matchPrompt = `Score this candidate match (0-1.0):
+
+Job Requirements:
+Company: ${job.employers.company_name}
+Title: ${job.title}
+Required Skills: ${JSON.stringify(job.required_skills)}
+Behavioral Requirements: ${JSON.stringify(job.behavioral_traits)}
+Description: ${job.description}
+
+Candidate Profile:
+Name: ${seeker.users.full_name}
+Skills: ${JSON.stringify(seeker.skills)}
+Experience: ${seeker.experience_years} years
+Preferred Roles: ${JSON.stringify(seeker.preferred_roles)}
+Behavioral Traits: ${JSON.stringify(seeker.behavioral_traits)}
+
+Provide a JSON response:
+{
+  "match_score": 0.85,
+  "technical_fit": 0.90,
+  "behavioral_fit": 0.80,
+  "explanation": "Strong candidate because..."
+}`;
+
+      const matchResult = await analyzeWithGroq(matchPrompt);
+      
+      try {
+        const jsonMatch = matchResult.match(/\{[\s\S]*\}/);
+        const matchData = jsonMatch ? JSON.parse(jsonMatch[0]) : { 
+          match_score: 0.70, 
+          technical_fit: 0.70,
+          behavioral_fit: 0.70,
+          explanation: "Good general fit" 
+        };
+        
+        return {
+          candidateId: seeker.id,
+          candidateName: seeker.users.full_name,
+          candidateEmail: seeker.users.email,
+          matchScore: parseFloat(matchData.match_score.toFixed(2)),
+          technicalFit: parseFloat(matchData.technical_fit.toFixed(2)),
+          behavioralFit: parseFloat(matchData.behavioral_fit.toFixed(2)),
+          explanation: matchData.explanation
+        };
+      } catch (parseError) {
+        return {
+          candidateId: seeker.id,
+          candidateName: seeker.users.full_name,
+          candidateEmail: seeker.users.email,
+          matchScore: 0.70,
+          technicalFit: 0.70,
+          behavioralFit: 0.70,
+          explanation: "Potential candidate based on requirements"
+        };
+      }
+    }));
+
+    // Save all matches to database
+    const matchesToInsert = candidateResults.map(match => ({
+      job_seeker_id: match.candidateId,
+      job_listing_id: jobId,
+      match_score: match.matchScore,
+      technical_fit: match.technicalFit,
+      behavioral_fit: match.behavioralFit,
+      status: 'pending',
+      match_date: new Date().toISOString()
+    }));
+
+    if (matchesToInsert.length > 0) {
+      const { error: matchInsertError } = await supabase
+        .from('matches')
+        .upsert(matchesToInsert, { 
+          onConflict: 'job_seeker_id,job_listing_id',
+          ignoreDuplicates: false 
+        })
+        .select();
+
+      if (matchInsertError) {
+        console.error('Match insert error:', matchInsertError);
+      }
+    }
+
+    // Sort by match score
+    const sortedCandidates = candidateResults
+      .sort((a, b) => b.matchScore - a.matchScore)
+      .map(c => ({
+        ...c,
+        matchScore: (c.matchScore * 100).toFixed(0) + '%',
+        technicalFit: (c.technicalFit * 100).toFixed(0) + '%',
+        behavioralFit: (c.behavioralFit * 100).toFixed(0) + '%'
+      }));
+
+    res.json({ 
+      success: true,
+      candidateCount: sortedCandidates.length,
+      candidates: sortedCandidates 
+    });
+  } catch (error) {
+    console.error('Error fetching candidates:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
